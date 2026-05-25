@@ -5,6 +5,9 @@
 #include "driver/i2c.h"
 #include "esp_log.h"
 #include "esp_err.h"
+#include <math.h>
+#include "mpu6050_filter.h"
+#include "mpu6050_ble.h"
 
 #define TAG "MPU6050"
 
@@ -17,9 +20,17 @@
 
 /* MPU6050 寄存器 */
 #define MPU6050_ADDRESS             0x68
-#define MPU6050_RA_PWR_MGMT_1       0x6B    //电源管理1号寄存器，核心控休眠、唤醒、时钟源选择
-#define MPU6050_RA_ACCEL_XOUT_H     0x3B    //加速度计X轴输出高8位寄存器地址,后接温度、陀螺仪数据，可连续一次性读取14字节批量拿全数据
-#define MPU6050_RA_TEMP_OUT_H       0x41    //MPU6050芯片内部温度数据高8位寄存器地址
+#define MPU6050_RA_PWR_MGMT_1       0x6B
+#define MPU6050_RA_ACCEL_XOUT_H     0x3B
+#define MPU6050_RA_GYRO_XOUT_H      0x43
+#define MPU6050_RA_TEMP_OUT_H       0x41
+
+/* 工作参数 */
+#define WAKEUP_INTERVAL_MS      2000    // 休眠期间唤醒检查间隔
+#define MOTION_THRESHOLD        300.0f  // 降低阈值以更灵敏地捕捉微小运动
+#define STABLE_TIME_THRESHOLD_MS 5000   // 长时间变化不大则休眠的时间阈值
+#define SAMPLE_INTERVAL_MS      20      // 采样间隔
+#define GYRO_AUTO_ZERO_COUNT    100     // 连续100次低运动量则触发一次微调零
 
 // 三重校准偏移量
 float accel_x_offset = 0, accel_y_offset = 0, accel_z_offset = 0;
@@ -59,6 +70,18 @@ static esp_err_t mpu_write(uint8_t reg, uint8_t data) {
 
 static esp_err_t mpu_read(uint8_t reg, uint8_t *data, size_t len) {
     return i2c_master_write_read_device(I2C_MASTER_NUM, MPU6050_ADDRESS, &reg, 1, data, len, pdMS_TO_TICKS(I2C_MASTER_TIMEOUT_MS));
+}
+
+// 休眠控制
+void mpu6050_sleep(void) {
+    mpu_write(MPU6050_RA_PWR_MGMT_1, 0x40); // 设置 SLEEP 位为 1
+    ESP_LOGI(TAG, "传感器进入休眠模式");
+}
+
+void mpu6050_wake(void) {
+    mpu_write(MPU6050_RA_PWR_MGMT_1, 0x00); // 设置 SLEEP 位为 0
+    vTaskDelay(pdMS_TO_TICKS(100)); // 等待传感器稳定
+    ESP_LOGI(TAG, "传感器已唤醒");
 }
 
 // 读取温度
@@ -195,49 +218,111 @@ void auto_recalibrate(void)
 void app_main(void)
 {
     i2c_master_init();
-    mpu_write(MPU6050_RA_PWR_MGMT_1, 0x00);
-    vTaskDelay(100);
-    ESP_LOGI(TAG, "MPU6050 初始化成功");
+    mpu6050_wake();
+    
+    // 1. 初始化滤波和蓝牙
+    filter_init();
+    ble_init();
 
-    // 1. 上电校准
+    // 2. 上电校准
     mpu6050_calibrate();
 
-    // 2. 进入温漂自动维护模式
     ESP_LOGI(TAG, "=====================================");
-    ESP_LOGI(TAG, "  ✅ 开始实时输出校准后数据");
+    ESP_LOGI(TAG, "  ✅ 进入 Mahony 滤波与蓝牙传输模式");
     ESP_LOGI(TAG, "=====================================");
 
-    TickType_t last_calib_tick = xTaskGetTickCount();
-    const TickType_t calib_interval = pdMS_TO_TICKS(5000); //检查的时间间隔
+    float ax, ay, az, gx, gy, gz;
+    float prev_ax = 0, prev_ay = 0, prev_az = 0;
+    float roll, pitch, yaw;
+    float dt = SAMPLE_INTERVAL_MS / 1000.0f;
+    char ble_buf[128];
+    
+    TickType_t last_motion_tick = xTaskGetTickCount();
+    TickType_t last_accel_output_tick = xTaskGetTickCount();
+    bool is_sleeping = false;
+    int stationary_counter = 0;
 
     while (1) {
+        if (is_sleeping) {
+            vTaskDelay(pdMS_TO_TICKS(WAKEUP_INTERVAL_MS));
+            mpu6050_wake();
+        }
+
         // 读取补偿后数据
-        float ax, ay, az, gx, gy, gz;
         mpu6050_get_calibrated(&ax, &ay, &az, &gx, &gy, &gz);
 
-        // 调零后实时输出数据
-        ESP_LOGI(TAG, "ACC: %6.0f | %6.0f | %6.0f", ax, ay, az);
-        ESP_LOGI(TAG, "GYR: %6.0f | %6.0f | %6.0f", gx, gy, gz);
-        ESP_LOGI(TAG, "==================================================");
+        // 计算运动强度
+        float delta_accel = sqrt(pow(ax - prev_ax, 2) + pow(ay - prev_ay, 2) + pow(az - prev_az, 2));
+        float gyro_mag = sqrt(pow(gx, 2) + pow(gy, 2) + pow(gz, 2));
+        
+        prev_ax = ax; prev_ay = ay; prev_az = az;
 
-        // 更新温度补偿
-        update_temp_comp();
+        // 动态零偏补偿逻辑
+        if (gyro_mag < 50.0f && delta_accel < 50.0f) {
+            stationary_counter++;
+            if (stationary_counter > GYRO_AUTO_ZERO_COUNT) {
+                gyro_x_offset += gx * 0.05f;
+                gyro_y_offset += gy * 0.05f;
+                gyro_z_offset += gz * 0.05f;
+                stationary_counter = 0;
+            }
+        } else {
+            stationary_counter = 0;
+        }
 
-        // 5秒检查是否静止 → 自动重校准
-        if (xTaskGetTickCount() - last_calib_tick >= calib_interval) {
-            last_calib_tick = xTaskGetTickCount();
-
-            // 读陀螺仪原始值判断静止
-            uint8_t buf[14];
-            mpu_read(MPU6050_RA_ACCEL_XOUT_H, buf,14);
-            int16_t gx_raw = (buf[8]<<8)|buf[9];
-            int16_t gy_raw = (buf[10]<<8)|buf[11];
-            int16_t gz_raw = (buf[12]<<8)|buf[13];
-
-            if (abs(gx_raw) < 15 && abs(gy_raw) <15 && abs(gz_raw) <15) {
-                auto_recalibrate(); // 重调零
+        if (delta_accel > MOTION_THRESHOLD || gyro_mag > MOTION_THRESHOLD) {
+            last_motion_tick = xTaskGetTickCount();
+            if (is_sleeping) {
+                ESP_LOGW(TAG, "检测到运动，结束休眠！");
+                is_sleeping = false;
             }
         }
-        vTaskDelay(200);
+
+        if (!is_sleeping) {
+            // 陀螺仪原始数据转换为弧度/秒
+            float gx_rad = (gx / 131.0f) * M_PI / 180.0f;
+            float gy_rad = (gy / 131.0f) * M_PI / 180.0f;
+            float gz_rad = (gz / 131.0f) * M_PI / 180.0f;
+
+            // 使用 Mahony 滤波进行姿态解算
+            mahony_update(ax, ay, az, gx_rad, gy_rad, gz_rad, dt);
+            get_euler_angles(&roll, &pitch, &yaw);
+
+            // 每隔1秒输出一次加速度和姿态角，并发送到蓝牙
+            if (xTaskGetTickCount() - last_accel_output_tick >= pdMS_TO_TICKS(1000)) {
+                last_accel_output_tick = xTaskGetTickCount();
+                
+                // 格式化输出字符串
+                snprintf(ble_buf, sizeof(ble_buf), "ACC: [%.0f,%.0f,%.0f] RPY: [%.2f,%.2f,%.2f]\n", 
+                         ax, ay, az, roll, pitch, yaw);
+                
+                // 串口输出
+                ESP_LOGI(TAG, "--- 实时输出 (1s) ---");
+                printf("%s", ble_buf);
+                ESP_LOGI(TAG, "----------------------");
+
+                // 蓝牙输出
+                if (ble_is_connected()) {
+                    ble_send_data(ble_buf);
+                }
+            }
+
+            // 更新温度补偿
+            update_temp_comp();
+
+            // 检查是否长时间静止
+            if (xTaskGetTickCount() - last_motion_tick > pdMS_TO_TICKS(STABLE_TIME_THRESHOLD_MS)) {
+                ESP_LOGW(TAG, "长时间静止，准备进入休眠...");
+                mpu6050_sleep();
+                is_sleeping = true;
+            }
+
+            vTaskDelay(pdMS_TO_TICKS(SAMPLE_INTERVAL_MS));
+        } else {
+            // 如果唤醒检查后依然没有运动，继续休眠
+            if (xTaskGetTickCount() - last_motion_tick > pdMS_TO_TICKS(STABLE_TIME_THRESHOLD_MS)) {
+                mpu6050_sleep();
+            }
+        }
     }
 }
