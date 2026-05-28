@@ -3,6 +3,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/i2c.h"
+#include "driver/ledc.h"
 #include "esp_log.h"
 #include "esp_err.h"
 #include <math.h>
@@ -208,10 +209,74 @@ void auto_recalibrate(void)
     // 输出最新偏移量
     ESP_LOGI(TAG, "==================================================");
     ESP_LOGI(TAG, "  🔵 重新调零完成！最新偏移量：");
-    ESP_LOGI(TAG, "TEMP: %.1f", temp_ref);
-    ESP_LOGI(TAG, "ACC: %.1f, %.1f, %.1f", accel_x_offset, accel_y_offset, accel_z_offset);
-    ESP_LOGI(TAG, "GYR: %.1f, %.1f, %.1f", gyro_x_offset, gyro_y_offset, gyro_z_offset);
+    ESP_LOGI(TAG, "TEMP: %.2f", temp_ref);
+    ESP_LOGI(TAG, "ACC: %.2f, %.2f, %.2f", accel_x_offset, accel_y_offset, accel_z_offset);
+    ESP_LOGI(TAG, "GYR: %.2f, %.2f, %.2f", gyro_x_offset, gyro_y_offset, gyro_z_offset);
     ESP_LOGI(TAG, "==================================================");
+}
+
+// 3轴PWM输出初始化:
+void pwm_3axis_init(void)
+{
+    // 定时器配置（共用一个定时器，三路PWM同步）
+    ledc_timer_config_t timer_conf = {
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .timer_num = LEDC_TIMER_0,
+        .duty_resolution = LEDC_TIMER_8_BIT,  // 0~255
+        .freq_hz = 10000,                       // 10kHz
+        .clk_cfg = LEDC_AUTO_CLK,
+    };
+    ledc_timer_config(&timer_conf);
+
+    ledc_channel_config_t ch0 = {
+        .gpio_num = 15, //ax
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = LEDC_CHANNEL_0,
+        .timer_sel = LEDC_TIMER_0,
+        .duty = 0,
+    };
+    ledc_channel_config(&ch0);
+
+    ledc_channel_config_t ch1 = {
+        .gpio_num = 16, //ay
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = LEDC_CHANNEL_1,
+        .timer_sel = LEDC_TIMER_0,
+        .duty = 0,
+    };
+    ledc_channel_config(&ch1);
+
+    ledc_channel_config_t ch2 = {
+        .gpio_num = 17, //az
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = LEDC_CHANNEL_2,
+        .timer_sel = LEDC_TIMER_0,
+        .duty = 0,
+    };
+    ledc_channel_config(&ch2);
+}
+
+void accel_3axis_to_pwm(float ax, float ay, float az)
+{
+    // 把 -2g ~ +2g 映射到 0~255
+    int32_t duty_x = (int32_t)((ax + 2.0f) * 127.0f);
+    int32_t duty_y = (int32_t)((ay + 2.0f) * 127.0f);
+    int32_t duty_z = (int32_t)((az + 2.0f) * 127.0f);
+
+    // 限幅（防止超出 0~255）
+    duty_x = (duty_x < 0) ? 0 : (duty_x > 255) ? 255 : duty_x;
+    duty_y = (duty_y < 0) ? 0 : (duty_y > 255) ? 255 : duty_y;
+    duty_z = (duty_z < 0) ? 0 : (duty_z > 255) ? 255 : duty_z;
+
+    // 分别输出到3个GPIO
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty_x);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, duty_y);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
+
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2, duty_z);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2);
 }
 
 // 主函数
@@ -241,6 +306,8 @@ void app_main(void)
     TickType_t last_accel_output_tick = xTaskGetTickCount();
     bool is_sleeping = false;
     int stationary_counter = 0;
+
+    pwm_3axis_init();
 
     while (1) {
         if (is_sleeping) {
@@ -293,14 +360,14 @@ void app_main(void)
                 last_accel_output_tick = xTaskGetTickCount();
                 
                 // 格式化输出字符串
-                snprintf(ble_buf, sizeof(ble_buf), "ACC: [%.0f,%.0f,%.0f] RPY: [%.2f,%.2f,%.2f]\n", 
-                         ax, ay, az, roll, pitch, yaw);
+                snprintf(ble_buf, sizeof(ble_buf), "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\n", 
+                         ax, ay, az/16384.0, roll, pitch, yaw);
                 
                 // 串口输出
-                ESP_LOGI(TAG, "--- 实时输出 (1s) ---");
+                //ESP_LOGI(TAG, "--- 实时输出 (1s) ---");
                 printf("%s", ble_buf);
-                ESP_LOGI(TAG, "----------------------");
-
+                //PWM输出
+                accel_3axis_to_pwm(ax, ay, az/16384.0);
                 // 蓝牙输出
                 if (ble_is_connected()) {
                     ble_send_data(ble_buf);
